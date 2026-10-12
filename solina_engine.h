@@ -4,9 +4,9 @@
 // et testé sur hôte.
 //
 // Chaîne : 12 oscillateurs maîtres (divide-down, carrés band-limités polyBLEP,
-// phases verrouillées) -> 6 registres (taps d'octave + formant HP/LP résonant)
-// -> enveloppe AR globale -> filtre passe-bas global (SVF) -> ensemble 3 BBD +
-// 2 LFO (stéréo) -> phaser optionnel -> sortie.
+// phases verrouillées) -> 6 registres (taps d'octave + formant HP/LP résonant,
+// chaque voix pondérée par sa propre enveloppe AR) -> filtre passe-bas global
+// (SVF) -> ensemble 3 BBD + 2 LFO (stéréo) -> phaser optionnel -> sortie.
 #include <math.h>
 #include <stdint.h>
 #include <string.h>
@@ -25,7 +25,11 @@ public:
   static const int MAX_HELD = 16;
   static const int NB_L = 10; // divisions d'octave utiles (L = 0..9)
   static const int MAX_SQ = 12 * NB_L;
-  static const int MAX_TAPS = MAX_HELD * SOLINA_MAX_TAPS;
+  // Nombre de voix simultanées possibles : notes tenues + queues de release qui
+  // se chevauchent (une même note rejouée pendant sa release crée une nouvelle
+  // voix, d'où la marge par rapport à MAX_HELD).
+  static const int MAX_SOUNDING = 24;
+  static const int MAX_TAPS = MAX_SOUNDING * SOLINA_MAX_TAPS;
   static const int ENBUF_LEN = 1600;
   static const int PH_STAGES = 4;
   static const int PH_DECIM = 8; // recalcule du coeff phaser tous les 8 éch.
@@ -95,6 +99,7 @@ public:
       // formant : HP 1 pôle
       formHP_a[r] = expf(-2.0f * (float)M_PI * c.fLo / (float)SR);
       hpLp[r] = 0.0f;
+      hpLp2[r] = 0.0f;
       // formant : LP résonant (SVF TPT, coeffs fixes)
       float fc = c.fHi;
       if (fc > 0.45f * SR)
@@ -117,6 +122,7 @@ public:
     ensIncB = 2.0f * (float)M_PI * ensRate2 / (float)SR;
     aBbd = expf(-2.0f * (float)M_PI * ensBbdFc / (float)SR);
     ensLfoA = ensLfoB = 0.0f;
+    ensDepthCur = ensDepth;
     bbd0 = bbd1 = bbd2 = 0.0f;
     ensW = 0;
     memset((void *)ensBuf, 0, sizeof(ensBuf));
@@ -130,17 +136,25 @@ public:
     memset((void *)phX, 0, sizeof(phX));
     memset((void *)phY, 0, sizeof(phY));
 
-    memset((void *)held, 0, sizeof(held));
-    nHeld = 0;
-    gate = false;
-    env = 0.0f;
-    pulsePos = PULSE_LEN;
+    memset((void *)voices, 0, sizeof(voices));
+    nVoices = 0;
+    nActiveNote = 0;
+    activeVoices = 0;
+    memset((void *)noteEnvSum, 0, sizeof(noteEnvSum));
+    lastEnv = 0.0f;
 
     rebuildActive();
   }
 
   // -----------------------------------------------------------------------
-  int heldCount() const { return nHeld; }
+  int heldCount() const
+  {
+    int c = 0;
+    for (int v = 0; v < nVoices; v++)
+      if (voices[v].gate)
+        c++;
+    return c;
+  }
 
   void setRegister(int r, bool on)
   {
@@ -226,72 +240,92 @@ public:
       minc[pc] = mbase[pc] * k;
   }
 
+  // Chaque note-on crée une voix indépendante (rejouer la même note pendant sa
+  // release crée une voix de plus) avec sa propre enveloppe AR : les queues de
+  // release se chevauchent naturellement et aucune note n'est coupée quand on en
+  // rejoue une autre. Une voix n'est libérée qu'à extinction de son enveloppe.
   void noteOn(int n)
   {
     if (n < KEY_LO || n > KEY_HI || n > 127)
       return;
-    if (held[n])
-    {
-      gate = true;
-      return;
-    }
     int mv = (maxVoices < 1) ? 1 : maxVoices;
-    while (nHeld >= mv && nHeld > 0)
-      noteOff(heldList[0]); // vol de voix : on libère la plus ancienne
-
-    bool wasSilent = (nHeld == 0);
-    held[n] = true;
-    heldList[nHeld++] = n;
-    rebuildActive();
-    if (wasSilent)
+    while (countGated() >= mv) // vol de voix : libère les plus anciennes tenues
     {
-      env = 0.0f;
-      pulsePos = 0;
+      int victim = oldestGated();
+      if (victim < 0)
+        break;
+      voices[victim].gate = false;
     }
-    gate = true;
+    bool wasSilent = (nVoices == 0);
+    int idx = allocVoice();
+    if (idx < 0)
+      return;
+    voices[idx].note = (int8_t)n;
+    voices[idx].gate = true;
+    voices[idx].env = 0.0f; // attaque neuve (avec pulse) pour chaque note-on
+    voices[idx].pulse = 0;
+    if (wasSilent)
+      activeVoices = 0; // nouvelle phrase : la normalisation repart de 1 voix
+    int g = countGated();
+    if (g > activeVoices)
+      activeVoices = g;
+    rebuildActive();
   }
 
   void noteOff(int n)
   {
-    if (n < 0 || n > 127 || !held[n])
+    if (n < 0 || n > 127)
       return;
-    held[n] = false;
-    for (int i = 0; i < nHeld; i++)
-      if (heldList[i] == n)
+    for (int v = 0; v < nVoices; v++)
+      if (voices[v].note == n && voices[v].gate) // plus ancienne voix tenue
       {
-        for (int j = i; j < nHeld - 1; j++)
-          heldList[j] = heldList[j + 1];
-        nHeld--;
-        break;
+        voices[v].gate = false;
+        return;
       }
-    if (nHeld == 0)
-      gate = false;
-    rebuildActive();
   }
 
   void allNotesOff()
   {
-    memset((void *)held, 0, sizeof(held));
-    nHeld = 0;
-    gate = false;
+    nVoices = 0;
+    nActiveNote = 0;
+    activeVoices = 0;
+    memset((void *)noteEnvSum, 0, sizeof(noteEnvSum));
+    lastEnv = 0.0f;
     rebuildActive();
   }
 
-  // Ramène la polyphonie au nombre de voix autorisé (appelé après réduction de
-  // maxVoices par le firmware).
+  // Ramène la polyphonie au nombre de voix tenues autorisé (appelé après
+  // réduction de maxVoices par le firmware). Les queues de release continuent.
   void enforcePolyphony()
   {
     int mv = (maxVoices < 1) ? 1 : maxVoices;
-    while (nHeld > mv && nHeld > 0)
-      noteOff(heldList[0]);
+    while (countGated() > mv)
+    {
+      int victim = oldestGated();
+      if (victim < 0)
+        break;
+      voices[victim].gate = false;
+    }
+    rebuildActive();
   }
 
   // -----------------------------------------------------------------------
   // Rend un bloc stéréo entrelacé (int16).
   void render(int16_t *out, int frames)
   {
+    // Retire les voix dont la release est terminée (reconstruit les taps si le
+    // jeu de notes a changé).
+    compactVoices();
+
+    // Enveloppe représentative (max des voix) pour le suivi d'enveloppe du
+    // filtre global, dont les coeffs sont recalculés une fois par bloc.
+    float env = maxEnv();
+
     // Filtre global : coeffs recalculés une fois par bloc (env varie lentement)
-    float fc = toneToHz(tone + env * toneEnv);
+    // Enveloppe de tone multiplicative bornée : une addition dans le domaine de
+    // toneToHz (croissance très rapide) saturait la coupure contre Nyquist, ce
+    // qui rendait la résonance inaudible dès que toneEnv > 0.
+    float fc = toneToHz(tone) * powf(2.0f, toneEnv * env * 2.5f);
     if (fc > 0.45f * SR)
       fc = 0.45f * SR;
     float g = tanf((float)M_PI * fc / (float)SR);
@@ -303,7 +337,16 @@ public:
     // Ensemble : LFO calculés une seule fois par bloc puis interpolés
     // linéairement entre le début et la fin du bloc (le LFO est très lent).
     float eM0s = 0, eM1s = 0, eM2s = 0, eM0e = 0, eM1e = 0, eM2e = 0;
+    float ensDepthS = ensDepthCur, ensDepthE = ensDepthCur;
     float invFrames = (frames > 0) ? 1.0f / (float)frames : 0.0f;
+    // Compensation de polyphonie (normalisation en énergie) : évite que la
+    // somme des voix ne sature le soft-clip de sortie quand on joue un accord.
+    float voiceScale = 1.0f / sqrtf((float)(activeVoices > 0 ? activeVoices : 1));
+    // La saturation BBD est normalisée par le nombre de voix : la somme d'un
+    // accord a un facteur de crête plus élevé qu'une note seule, donc elle
+    // saturait davantage (intermodulation). On applique voiceScale à la drive
+    // pour que l'étage sature pareil quelle que soit la polyphonie.
+    float ensDriveEff = ensDrive * voiceScale;
     if (ensemble)
     {
       eM0s = sinf(ensLfoA);
@@ -320,10 +363,42 @@ public:
         ensLfoA -= 6.2831853f;
       if (ensLfoB >= 6.2831853f)
         ensLfoB -= 6.2831853f;
+      // profondeur lissée sur le bloc (évite le clic quand le CC varie)
+      ensDepthE = ensDepthS + (ensDepth - ensDepthS) * ENS_DEPTH_SMOOTH;
+      ensDepthCur = ensDepthE;
     }
 
     for (int i = 0; i < frames; i++)
     {
+      // 0. enveloppes AR par voix, puis somme par note (pour les taps)
+      for (int j = 0; j < nActiveNote; j++)
+        noteEnvSum[activeNote[j]] = 0.0f;
+      for (int v = 0; v < nVoices; v++)
+      {
+        Voice &e = voices[v];
+        if (e.gate)
+        {
+          if (e.env < 1.0f)
+          {
+            e.env += (1.0f - e.env) * atkC;
+            if (e.env > 1.0f)
+              e.env = 1.0f;
+          }
+          if (e.pulse < PULSE_LEN)
+          {
+            e.env *= 0.4f + 0.6f * ((float)e.pulse / (float)PULSE_LEN);
+            e.pulse++;
+          }
+        }
+        else
+        {
+          e.env *= relC;
+          if (e.env < ENV_EPS)
+            e.env = 0.0f;
+        }
+        noteEnvSum[e.note] += e.env;
+      }
+
       // 1. maîtres
       for (int pc = 0; pc < 12; pc++)
       {
@@ -350,13 +425,17 @@ public:
         float acc = 0.0f;
         int nt = regTapsN[r];
         for (int t = 0; t < nt; t++)
-          acc += sqVal[regTapsIdx[r][t]] * regTapsW[r][t];
+          acc += sqVal[regTapsIdx[r][t]] * regTapsW[r][t] * noteEnvSum[regTapsNote[r][t]];
 
         float x = acc;
         float lpv = hpLp[r];
         lpv += (1.0f - formHP_a[r]) * (x - lpv);
         hpLp[r] = lpv;
-        x -= lpv; // HP
+        x -= lpv; // HP 1er pôle
+        lpv = hpLp2[r];
+        lpv += (1.0f - formHP_a[r]) * (x - lpv);
+        hpLp2[r] = lpv;
+        x -= lpv; // HP 2e pôle (pente 12 dB/oct)
 
         float c1 = frIc1[r], c2 = frIc2[r];
         float v3 = x - c2;
@@ -366,26 +445,9 @@ public:
         frIc2[r] = 2.0f * v2 - c2;
         bus += v2;
       }
+      bus *= voiceScale;
 
-      // 4. enveloppe AR globale
-      if (gate)
-      {
-        if (env < 1.0f)
-        {
-          env += (1.0f - env) * atkC;
-          if (env > 1.0f)
-            env = 1.0f;
-        }
-        if (pulsePos < PULSE_LEN)
-        {
-          env *= 0.4f + 0.6f * ((float)pulsePos / (float)PULSE_LEN);
-          pulsePos++;
-        }
-      }
-      else
-      {
-        env *= relC;
-      }
+      // (l'enveloppe AR est désormais appliquée par voix, avant le formant)
 
       // 5. filtre passe-bas global (SVF TPT)
       float c1 = gfIc1, c2 = gfIc2;
@@ -404,21 +466,22 @@ public:
         float m0 = eM0s + (eM0e - eM0s) * t;
         float m1 = eM1s + (eM1e - eM1s) * t;
         float m2 = eM2s + (eM2e - eM2s) * t;
+        float ed = ensDepthS + (ensDepthE - ensDepthS) * t;
 
         ensBuf[0][ensW] = bus;
         ensBuf[1][ensW] = bus;
         ensBuf[2][ensW] = bus;
 
-        float s0 = readDelay(ensBuf[0], ensBase[0] * (1.0f + ensDepth * m0));
-        float s1 = readDelay(ensBuf[1], ensBase[1] * (1.0f + ensDepth * m1));
-        float s2 = readDelay(ensBuf[2], ensBase[2] * (1.0f + ensDepth * m2));
+        float s0 = readDelay(ensBuf[0], ensBase[0] * (1.0f + ed * m0));
+        float s1 = readDelay(ensBuf[1], ensBase[1] * (1.0f + ed * m1));
+        float s2 = readDelay(ensBuf[2], ensBase[2] * (1.0f + ed * m2));
 
         bbd0 += (1.0f - aBbd) * (s0 - bbd0);
         bbd1 += (1.0f - aBbd) * (s1 - bbd1);
         bbd2 += (1.0f - aBbd) * (s2 - bbd2);
-        s0 = fastTanh(ensDrive * bbd0);
-        s1 = fastTanh(ensDrive * bbd1);
-        s2 = fastTanh(ensDrive * bbd2);
+        s0 = fastTanh(ensDriveEff * bbd0);
+        s1 = fastTanh(ensDriveEff * bbd1);
+        s2 = fastTanh(ensDriveEff * bbd2);
 
         ensW++;
         if (ensW >= ENBUF_LEN)
@@ -453,11 +516,11 @@ public:
         R = allpass(R, 1, phAp);
       }
 
-      // 8. sortie : HP infra 12 Hz puis enveloppe + gain
+      // 8. sortie : HP infra 12 Hz puis gain (l'enveloppe est déjà par voix)
       dcYl += (1.0f - aDc) * (L - dcYl);
       dcYr += (1.0f - aDc) * (R - dcYr);
-      float yl = fastTanh((L - dcYl) * env * outGain);
-      float yr = fastTanh((R - dcYr) * env * outGain);
+      float yl = fastTanh((L - dcYl) * outGain);
+      float yr = fastTanh((R - dcYr) * outGain);
       out[2 * i] = (int16_t)(yl * 32767.0f);
       out[2 * i + 1] = (int16_t)(yr * 32767.0f);
     }
@@ -465,6 +528,11 @@ public:
 
 private:
   static const int PULSE_LEN = (int)(0.012f * SR);
+  static constexpr float ENV_EPS = 0.001f; // seuil de fin de release
+  // Lissage par bloc de la profondeur d'ensemble : la profondeur module le
+  // retard BBD ; un saut par CC produit un clic (craquements en bougeant la
+  // molette de modulation). On interpole la valeur sur le bloc.
+  static constexpr float ENS_DEPTH_SMOOTH = 0.5f;
 
   // 1/2^L précalculés (évite des divisions dans oscAt).
   static constexpr float INV_TWO_L[NB_L] = {
@@ -481,6 +549,7 @@ private:
   float effW[SOLINA_NB_REG][SOLINA_MAX_TAPS];
   float formHP_a[SOLINA_NB_REG];
   float hpLp[SOLINA_NB_REG];
+  float hpLp2[SOLINA_NB_REG];
   float frA1[SOLINA_NB_REG], frA2[SOLINA_NB_REG], frA3[SOLINA_NB_REG];
   float frIc1[SOLINA_NB_REG], frIc2[SOLINA_NB_REG];
 
@@ -492,16 +561,28 @@ private:
   int regTapsN[SOLINA_NB_REG];
   int regTapsIdx[SOLINA_NB_REG][MAX_TAPS];
   float regTapsW[SOLINA_NB_REG][MAX_TAPS];
+  int regTapsNote[SOLINA_NB_REG][MAX_TAPS]; // note MIDI source (pour l'enveloppe)
 
-  // notes tenues
-  bool held[128];
-  int heldList[MAX_HELD];
-  int nHeld;
-  bool gate;
+  // Voix : chaque note-on crée une voix avec sa propre enveloppe AR. Une note
+  // relâchée garde sa voix jusqu'à extinction (queue), et rejouer la même note
+  // pendant sa release crée une voix supplémentaire : les deux se chevauchent.
+  struct Voice
+  {
+    int8_t note;
+    bool gate;
+    float env;
+    int pulse;
+  };
+  Voice voices[MAX_SOUNDING];
+  int nVoices;
+  int activeVoices; // compteur de normalisation de polyphonie (par phrase)
+  int nActiveNote;              // notes distinctes actives
+  int activeNote[MAX_SOUNDING]; // liste de ces notes
 
   // enveloppe
-  float env, atkC, relC;
-  int pulsePos;
+  float atkC, relC;
+  float noteEnvSum[128]; // somme des enveloppes par note (calculée par échantillon)
+  float lastEnv;         // enveloppe max courante (pour l'éclairage/telemetry)
 
   // filtre global
   float gfIc1, gfIc2, gfA1, gfA2, gfA3;
@@ -510,6 +591,7 @@ private:
   float ensBuf[3][ENBUF_LEN];
   int ensW;
   float aBbd, ensIncA, ensIncB, ensLfoA, ensLfoB;
+  float ensDepthCur; // profondeur lissée (évite les clics quand le CC varie)
   float bbd0, bbd1, bbd2;
 
   // phaser
@@ -608,16 +690,97 @@ private:
     return v * 0.7f;
   }
 
+  int countGated() const
+  {
+    int c = 0;
+    for (int v = 0; v < nVoices; v++)
+      if (voices[v].gate)
+        c++;
+    return c;
+  }
+
+  float maxEnv() const
+  {
+    float m = 0.0f;
+    for (int v = 0; v < nVoices; v++)
+      if (voices[v].env > m)
+        m = voices[v].env;
+    return m;
+  }
+
+  int oldestGated() const
+  {
+    for (int v = 0; v < nVoices; v++)
+      if (voices[v].gate)
+        return v;
+    return -1;
+  }
+
+  // Alloue une voix libre, ou vole la plus silencieuse si le pool est plein.
+  int allocVoice()
+  {
+    if (nVoices < MAX_SOUNDING)
+      return nVoices++;
+    int victim = -1;
+    float lo = 1e9f;
+    for (int v = 0; v < nVoices; v++)
+      if (!voices[v].gate && voices[v].env < lo)
+      {
+        lo = voices[v].env;
+        victim = v;
+      }
+    return victim;
+  }
+
+  // Retire les voix éteintes (release terminée) et reconstruit les taps si le
+  // jeu de notes a changé.
+  void compactVoices()
+  {
+    int w = 0;
+    bool removed = false;
+    for (int v = 0; v < nVoices; v++)
+    {
+      if (!voices[v].gate && voices[v].env <= 0.0f)
+      {
+        removed = true;
+        continue;
+      }
+      if (w != v)
+        voices[w] = voices[v];
+      w++;
+    }
+    nVoices = w;
+    if (nVoices == 0 && activeVoices != 0)
+      activeVoices = 0;
+    if (removed)
+      rebuildActive();
+  }
+
   void rebuildActive()
   {
+    // Reconstruit la liste des notes distinctes qui sonnent (tenues ou en
+    // release) puis la table des taps par registre, en mémorisant la note
+    // source de chaque tap (pour appliquer son enveloppe).
+    nActiveNote = 0;
     nSq = 0;
     memset((void *)sqUsed, 0, sizeof(sqUsed));
     for (int r = 0; r < SOLINA_NB_REG; r++)
       regTapsN[r] = 0;
 
-    for (int h = 0; h < nHeld; h++)
+    for (int v = 0; v < nVoices; v++)
     {
-      int n = heldList[h];
+      int n = voices[v].note;
+      bool known = false;
+      for (int j = 0; j < nActiveNote; j++)
+        if (activeNote[j] == n)
+        {
+          known = true;
+          break;
+        }
+      if (known)
+        continue;
+      activeNote[nActiveNote++] = n;
+
       int pc = n % 12;
       int k = (TOP_MIDI + pc - n) / 12;
       for (int r = 0; r < SOLINA_NB_REG; r++)
@@ -643,6 +806,7 @@ private:
           {
             regTapsIdx[r][nt] = id;
             regTapsW[r][nt] = effW[r][t];
+            regTapsNote[r][nt] = n;
             regTapsN[r] = nt + 1;
           }
         }
